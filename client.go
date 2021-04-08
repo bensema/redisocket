@@ -13,12 +13,11 @@ import (
 //Client gorilla websocket wrap struct
 type Client struct {
 	activityTime time.Time
-	prefix       string
+	appKey       string
+	channels     map[string]bool
 	sid          string
 	uid          string
 	ws           *websocket.Conn
-	events       map[string]EventHandler
-	channels     map[string]bool
 	send         chan *Payload
 	*sync.RWMutex
 	re   ReceiveMsgHandler
@@ -29,6 +28,7 @@ type Client struct {
 func (c *Client) SocketId() string {
 	return c.sid
 }
+
 func (c *Client) contains(a []string, x string) bool {
 	for _, n := range a {
 		if x == n {
@@ -38,22 +38,20 @@ func (c *Client) contains(a []string, x string) bool {
 	return false
 }
 
-func (c *Client) SetChannels(s []string) {
+func (c *Client) SetChannels(channels []string) {
 	c.Lock()
 	defer c.Unlock()
-	c.auth.Channels = s
-	for k, _ := range c.events {
-		if !c.contains(s, k) {
-			delete(c.events, k)
+	for k, _ := range c.channels {
+		if !c.contains(channels, k) {
+			delete(c.channels, k)
 		}
 	}
 }
-func (c *Client) AddChannel(s string) {
+
+func (c *Client) AddChannel(channel string) {
 	c.Lock()
 	defer c.Unlock()
-	if !c.contains(c.auth.Channels, s) {
-		c.auth.Channels = append(c.auth.Channels, s)
-	}
+	c.channels[channel] = true
 }
 
 func (c *Client) GetAuth() Auth {
@@ -66,47 +64,52 @@ func (c *Client) ActivityTime() {
 	c.activityTime = time.Now()
 }
 
-//On event.  client on event
-func (c *Client) On(event string, h EventHandler) {
+func (c *Client) Sub(channel string) {
 	c.Lock()
-	c.events[event] = h
+	c.channels[channel] = true
 	c.Unlock()
+
 	conn := c.hub.rpool.Get()
-	defer func() {
-		conn.Close()
-	}()
+	defer conn.Close()
 	nt := time.Now().Unix()
 	conn.Send("MULTI")
 	if c.uid != "" {
-		conn.Send("ZADD", c.hub.ChannelPrefix+c.prefix+"@"+"online", "CH", nt, c.uid)
+		conn.Send("ZADD", c.hub.ChannelPrefix+c.appKey+"@"+"online", "CH", nt, c.uid)
 	}
-	conn.Send("ZADD", c.hub.ChannelPrefix+c.prefix+"@"+"channels:"+event, "CH", nt, c.uid)
+	conn.Send("ZADD", c.hub.ChannelPrefix+c.appKey+"@"+"channels:"+channel, "CH", nt, c.sid)
 	conn.Do("EXEC")
-
 	return
 }
 
-//Off event. client off event
-func (c *Client) Off(event string) {
+//Off channel. client off channel
+func (c *Client) UnSub(channel string) {
 	c.Lock()
-	delete(c.events, event)
+	delete(c.channels, channel)
 	c.Unlock()
+
+	conn := c.hub.rpool.Get()
+	conn.Send("MULTI")
+	conn.Send("ZREM", c.hub.ChannelPrefix+c.appKey+"@"+"channels:"+channel, c.sid)
+	conn.Do("EXEC")
 	return
 }
 
-//Trigger event. trigger client register event
-func (c *Client) Trigger(event string, p *Payload) (err error) {
+func (c *Client) Trigger(channel string, p *Payload) (err error) {
 	c.RLock()
-	_, ok := c.events[event]
+	_, ok := c.channels[channel]
 	c.RUnlock()
 	if !ok {
-		return errors.New("no event")
+		return errors.New("no channel")
+	}
+
+	if p.AppKey != c.appKey {
+		return errors.New("no appKey")
 	}
 
 	select {
 	case c.send <- p:
 	default:
-		c.hub.logger("user %s disconnect  err: trigger buffer full", c.uid)
+		c.hub.logger("socket id %s disconnect  err: trigger buffer full", c.sid)
 		c.Close()
 	}
 	return
@@ -122,7 +125,7 @@ func (c *Client) Send(data []byte) {
 	select {
 	case c.send <- p:
 	default:
-		c.hub.logger("user %s disconnect  err: send buffer full", c.uid)
+		c.hub.logger("socket id %s disconnect  err: send buffer full", c.sid)
 		c.Close()
 	}
 	return
@@ -150,11 +153,11 @@ func (c *Client) readPump() {
 	for {
 		msgType, reader, err := c.ws.NextReader()
 		if err != nil {
-			c.hub.logger("user %s disconnect  err: websocket read out of max message size", c.uid)
+			c.hub.logger("socket id %s disconnect  err: websocket read out of max message size", c.sid)
 			return
 		}
 		if msgType != websocket.TextMessage {
-			c.hub.logger("user %s disconnect  err: send message type not text message", c.uid)
+			c.hub.logger("socket id %s disconnect  err: send message type not text message", c.sid)
 			continue
 		}
 
@@ -169,14 +172,14 @@ func (c *Client) readPump() {
 		_, err = io.Copy(buf.buffer, reader)
 		if err != nil {
 			buf.reset(nil)
-			c.hub.logger("user %s disconnect  err: copy buffer error", c.uid)
+			c.hub.logger("socket id %s disconnect  err: copy buffer error", c.sid)
 			return
 		}
 		statistic.AddInMsg(buf.buffer.Len())
 		select {
 		case c.hub.messageQueue.serveChan <- buf:
 		default:
-			c.hub.logger("user %s disconnect  err: server receive busy", c.uid)
+			c.hub.logger("socket id %s disconnect  err: server receive busy", c.sid)
 			return
 
 		}
@@ -207,21 +210,6 @@ func (c *Client) writePump() {
 				return
 			}
 
-			c.RLock()
-			h, ok := c.events[msg.Event]
-			c.RUnlock()
-			if ok {
-				if h != nil {
-					err := h(msg.Event, msg)
-					if err != nil {
-						c.hub.logger("socket id  %s disconnect  err: event callback execute error", c.sid)
-						return
-					}
-				} else {
-					c.hub.logger("socket id  %s disconnect  err: no event callback", c.sid)
-					return
-				}
-			}
 			statistic.AddOutMsg(msg.Len)
 			if msg.IsPrepare {
 
@@ -244,7 +232,7 @@ func (c *Client) writePump() {
 			}
 			//超過時間 都沒有事件訂閱 就斷線處理
 			//if len(c.events) == 0 {
-			//	c.hub.logger("user %s disconnect  err: timeout to subscribe", c.uid)
+			//	c.hub.logger("socket id %s disconnect  err: timeout to subscribe", c.sid)
 			//	return
 			//}
 		case <-aTime.C:

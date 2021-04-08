@@ -21,7 +21,7 @@ var statistic *Statistic
 
 //User client interface
 type User interface {
-	Trigger(event string, p *Payload) (err error)
+	Trigger(channel string, p *Payload) (err error)
 	Close()
 }
 
@@ -31,7 +31,8 @@ type Payload struct {
 	Data           []byte
 	PrepareMessage *websocket.PreparedMessage
 	IsPrepare      bool
-	Event          string
+	Channel        string
+	AppKey         string
 }
 
 //WebsocketOptional  init websocket hub config
@@ -44,18 +45,22 @@ type WebsocketOptional struct {
 	MaxMessageSize int64
 	Upgrader       websocket.Upgrader
 }
+
 type socketPayload struct {
 	Sid  string      `json:"sid"`
 	Data interface{} `json:"data"`
 }
+
 type userPayload struct {
 	Uid  string      `json:"uid"`
 	Data interface{} `json:"data"`
 }
+
 type reloadChannelPayload struct {
 	Uid      string   `json:"uid"`
 	Channels []string `json:"data"`
 }
+
 type addChannelPayload struct {
 	Uid     string `json:"uid"`
 	Channel string `json:"data"`
@@ -76,7 +81,7 @@ var (
 	}
 )
 
-//EventHandler event handler
+//EventHandler channel handler
 type EventHandler func(event string, payload *Payload) error
 
 //ReceiveMsgHandler client receive msg
@@ -84,7 +89,6 @@ type ReceiveMsgHandler func([]byte) ([]byte, error)
 
 //NewSender return sender  send to hub
 func NewSender(m *redis.Pool) (e *Sender) {
-
 	return &Sender{
 		redisManager: m,
 	}
@@ -97,8 +101,9 @@ type Sender struct {
 
 //BatchData push batch data struct
 type BatchData struct {
-	Event string
-	Data  []byte
+	Channel string
+	Event   string
+	Data    []byte
 }
 
 //GetChannels get all sub channels
@@ -146,7 +151,7 @@ func (s *Sender) PushBatch(channelPrefix, appKey string, data []BatchData) {
 	conn := s.redisManager.Get()
 	defer conn.Close()
 	for _, d := range data {
-		conn.Do("PUBLISH", channelPrefix+appKey+"@"+d.Event, d.Data)
+		conn.Do("PUBLISH", channelPrefix+appKey+"@"+d.Channel, d.Data)
 	}
 	return
 }
@@ -216,10 +221,10 @@ func (s *Sender) AddChannel(channelPrefix, appKey string, uid string, channel st
 }
 
 //Push push single data
-func (s *Sender) Push(channelPrefix, appKey string, event string, data []byte) (val int, err error) {
+func (s *Sender) Push(channelPrefix, appKey string, channel string, data []byte) (val int, err error) {
 	conn := s.redisManager.Get()
 	defer conn.Close()
-	val, err = redis.Int(conn.Do("PUBLISH", channelPrefix+appKey+"@"+event, data))
+	val, err = redis.Int(conn.Do("PUBLISH", channelPrefix+appKey+"@"+channel, data))
 	return
 }
 
@@ -236,7 +241,7 @@ func NewHub(m *redis.Pool, log *logrus.Logger, debug bool) (e *Hub) {
 	go statistic.Run()
 	pool := &pool{
 		users:              make(map[*Client]bool),
-		broadcastChan:      make(chan *eventPayload, 4096),
+		broadcastChan:      make(chan *BroadcastPayload, 4096),
 		joinChan:           make(chan *Client),
 		leaveChan:          make(chan *Client),
 		kickSidChan:        make(chan string),
@@ -270,7 +275,7 @@ func NewHub(m *redis.Pool, log *logrus.Logger, debug bool) (e *Hub) {
 }
 
 //Upgrade gorilla websocket wrap upgrade method
-func (e *Hub) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header, prefix string) (c *Client, err error) {
+func (e *Hub) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header, appKey string) (c *Client, err error) {
 	ws, err := e.Config.Upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		return
@@ -279,14 +284,15 @@ func (e *Hub) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader htt
 	auth := &Auth{}
 	sid := GenSocketID()
 	c = &Client{
-		prefix:  prefix,
-		sid:     sid,
-		ws:      ws,
-		send:    make(chan *Payload, 256),
-		RWMutex: new(sync.RWMutex),
-		hub:     e,
-		events:  make(map[string]EventHandler),
-		auth:    auth,
+		activityTime: time.Now(),
+		appKey:       appKey,
+		sid:          sid,
+		ws:           ws,
+		send:         make(chan *Payload, 256),
+		RWMutex:      new(sync.RWMutex),
+		hub:          e,
+		channels:     make(map[string]bool),
+		auth:         auth,
 	}
 
 	e.join(c)
@@ -314,6 +320,7 @@ func (e *Hub) Ping() (err error) {
 	}
 	return
 }
+
 func (e *Hub) logger(format string, v ...interface{}) {
 	if e.debug {
 		e.log.Infof(format, v...)
@@ -324,6 +331,7 @@ func (e *Hub) logger(format string, v ...interface{}) {
 func (e *Hub) CountOnlineUsers() (i int) {
 	return len(e.pool.users)
 }
+
 func (e *Hub) listenRedis() <-chan error {
 
 	errChan := make(chan error, 1)
@@ -333,13 +341,15 @@ func (e *Hub) listenRedis() <-chan error {
 			case redis.Message:
 
 				//過濾掉前綴
-
+				// v.Channel=>   别名.app_key@channel   eg. gusher.thisisappkey@GLOBAL
 				channel := strings.Replace(v.Channel, e.ChannelPrefix, "", -1)
 				//過濾掉@ 之前的字
 				sch := strings.SplitN(channel, "@", 2)
 				if len(sch) != 2 {
 					continue
 				}
+
+				appKey := sch[0]
 
 				//過濾掉星號
 				channel = strings.Replace(sch[1], "*", "", -1)
@@ -396,6 +406,9 @@ func (e *Hub) listenRedis() <-chan error {
 					Len:            len(v.Data),
 					PrepareMessage: pMsg,
 					IsPrepare:      true,
+
+					Channel: channel,
+					AppKey:  appKey,
 				}
 				e.broadcast(channel, p)
 

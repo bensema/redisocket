@@ -7,9 +7,9 @@ import (
 	"github.com/gomodule/redigo/redis"
 )
 
-type eventPayload struct {
+type BroadcastPayload struct {
 	payload *Payload
-	event   string
+	channel string
 }
 
 // pool 用
@@ -17,14 +17,17 @@ type uPayload struct {
 	uid  string `json:"uid"`
 	data []byte `json:"data"`
 }
+
 type uReloadChannelPayload struct {
 	uid      string   `json:"uid"`
 	channels []string `json:"channels"`
 }
+
 type uAddChannelPayload struct {
 	uid     string `json:"uid"`
 	channel string `json:"channel"`
 }
+
 type sPayload struct {
 	sid  string `json:"uid"`
 	data []byte `json:"data"`
@@ -32,7 +35,7 @@ type sPayload struct {
 
 type pool struct {
 	users              map[*Client]bool
-	broadcastChan      chan *eventPayload
+	broadcastChan      chan *BroadcastPayload
 	joinChan           chan *Client
 	leaveChan          chan *Client
 	shutdownChan       chan int
@@ -62,7 +65,7 @@ func (h *pool) run() <-chan error {
 			select {
 			case p := <-h.broadcastChan:
 				for u := range h.users {
-					u.Trigger(p.event, p.payload)
+					_ = u.Trigger(p.channel, p.payload)
 				}
 			case <-h.shutdownChan:
 				for u := range h.users {
@@ -161,15 +164,15 @@ func (h *pool) syncOnline() (err error) {
 	conn.Send("MULTI")
 	for u := range h.users {
 		if u.uid != "" {
-			conn.Send("ZADD", h.channelPrefix+u.prefix+"@"+"online", "CH", nt, u.uid)
+			conn.Send("ZADD", h.channelPrefix+u.appKey+"@"+"online", "CH", nt, u.uid)
 		}
 		u.RLock()
-		for e := range u.events {
-			conn.Send("ZADD", h.channelPrefix+u.prefix+"@"+"channels:"+e, "CH", nt, u.uid)
-			conn.Send("EXPIRE", h.channelPrefix+u.prefix+"@"+"channels:"+e, 300)
+		for ch := range u.channels {
+			conn.Send("ZADD", h.channelPrefix+u.appKey+"@"+"channels:"+ch, "CH", nt, u.sid)
+			conn.Send("EXPIRE", h.channelPrefix+u.appKey+"@"+"channels:"+ch, 300)
 		}
 		u.RUnlock()
-		conn.Send("EXPIRE", h.channelPrefix+u.prefix+"@"+"online", 300)
+		conn.Send("EXPIRE", h.channelPrefix+u.appKey+"@"+"online", 300)
 	}
 	conn.Do("EXEC")
 	tmp, err := redis.Strings(conn.Do("keys", h.channelPrefix+"*"))
@@ -184,12 +187,15 @@ func (h *pool) syncOnline() (err error) {
 	conn.Do("EXEC")
 	return
 }
-func (h *pool) broadcast(event string, p *Payload) {
-	h.broadcastChan <- &eventPayload{p, event}
+
+func (h *pool) broadcast(channel string, p *Payload) {
+	h.broadcastChan <- &BroadcastPayload{p, channel}
 }
+
 func (h *pool) join(c *Client) {
 	h.joinChan <- c
 }
+
 func (h *pool) leave(c *Client) {
 	h.leaveChan <- c
 }

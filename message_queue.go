@@ -1,9 +1,5 @@
 package redisocket
 
-import (
-	"log"
-)
-
 type messageQueue struct {
 	serveChan      chan *buffer
 	freeBufferChan chan *buffer
@@ -17,8 +13,8 @@ func (m *messageQueue) worker() {
 			m.serve(b)
 		}
 	}
-	log.Println("[redisocket] message queue crash")
 }
+
 func (m *messageQueue) run() {
 	for i := 0; i < 1024; i++ {
 		go m.worker()
